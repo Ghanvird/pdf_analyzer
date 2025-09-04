@@ -49,16 +49,24 @@ def _kraken_ocr_on_image(img: Image.Image) -> str:
                 pass
 
 # PaddleOCR (lazy)
+# PaddleOCR (lazy)
 _PADDLE = None
-def _paddle() -> PaddleOCR | None:
+def _paddle():
+    """
+    Create a PaddleOCR pipeline that uses local/cached models and **does not**
+    force the angle classifier (which requires PaddleX-format CLS bundles).
+    """
     global _PADDLE
     if _PADDLE is not None:
         return _PADDLE
     try:
-        _PADDLE = PaddleOCR(lang="en", use_angle_cls=True, show_log=False)
+        # Pass only portable kwargs; no show_log, no use_gpu, no cls_model_dir
+        from paddleocr import PaddleOCR
+        _PADDLE = PaddleOCR(lang="en")
     except Exception:
         _PADDLE = None
     return _PADDLE
+
 
 # ------------- core extractors -------------
 def extract_text_with_pdfplumber(pdf_bytes: bytes) -> Tuple[str, List[List[List[str]]]]:
@@ -97,7 +105,7 @@ def extract_text_with_paddle(pdf_bytes: bytes, conf_threshold: float = 0.70) -> 
             out_texts.append(_tesseract_ocr(img))
             continue
 
-        result = o.ocr(ImageOps.exif_transpose(img), cls=True)
+        result = o.ocr(ImageOps.exif_transpose(img), cls=False)
         # result structure: [[ [box, (text, score)], ... ]]
         blocks = result[0] if result else []
         lines: List[str] = []
