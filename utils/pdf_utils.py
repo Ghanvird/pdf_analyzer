@@ -1,14 +1,15 @@
 # utils/pdf_utils.py
+import contextlib, io as _io
 import io, os, re, subprocess, tempfile, shutil
 from typing import Dict, List, Tuple
+
+import numpy as np
 
 import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageOps, ImageFilter
 
 import pytesseract
-from paddleocr import PaddleOCR
-
 from .tesseract_path import ensure_tesseract, auto_set_poppler_cmd
 
 # ------------- binaries (offline) -------------
@@ -48,41 +49,58 @@ def _kraken_ocr_on_image(img: Image.Image) -> str:
             except Exception:
                 pass
 
-# --- PaddleOCR (lazy, offline) ---
 _PADDLE = None
 
+def _local_model_ok(path: str) -> bool:
+    return (
+        os.path.exists(os.path.join(path, "inference.pdmodel")) and
+        os.path.exists(os.path.join(path, "inference.pdiparams"))
+    )
+
 def _paddle():
-    """
-    Create a PaddleOCR pipeline that uses local det/rec only.
-    - No internet: we pass explicit det/rec dirs.
-    - No CLS stage: avoids PaddleX CLS bundle requirement.
-    """
+    """Create a PaddleOCR that uses only local det/rec models (no network)."""
     global _PADDLE
     if _PADDLE is not None:
         return _PADDLE
 
-    # Resolve local model dirs
+    # Tell PaddleX/PaddleOCR we’re offline
+    os.environ.setdefault("PADDLEX_OFFLINE", "1")
+    os.environ.setdefault("PPOCR_OFFLINE", "1")
+
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "paddleocr"))
     det_dir = os.environ.get("PADDLE_DET_DIR", os.path.join(root, "en_PP-OCRv3_det_infer"))
     rec_dir = os.environ.get("PADDLE_REC_DIR", os.path.join(root, "en_PP-OCRv3_rec_infer"))
 
-    def _has_model(d):
-        return os.path.exists(os.path.join(d, "inference.pdmodel")) and \
-               os.path.exists(os.path.join(d, "inference.pdiparams"))
-
-    # If either folder is missing, skip Paddle (prevents any download attempt)
-    if not (_has_model(det_dir) and _has_model(rec_dir)):
+    if not (_local_model_ok(det_dir) and _local_model_ok(rec_dir)):
+        # Models missing -> skip Paddle and let Tesseract handle it
         _PADDLE = None
         return _PADDLE
 
-    try:
-        from paddleocr import PaddleOCR  # lazy import
-        # Only portable args; no use_gpu, no show_log, no cls_model_dir
-        _PADDLE = PaddleOCR(det_model_dir=det_dir, rec_model_dir=rec_dir, lang="en")
-    except Exception:
-        _PADDLE = None
-    return _PADDLE
+    # Import inside a stdout/stderr redirect to hide hoster banners.
+    with contextlib.redirect_stdout(_io.StringIO()), contextlib.redirect_stderr(_io.StringIO()):
+        from paddleocr import PaddleOCR
 
+    # Try v3 first (has extra switches), then v2 style.
+    tried = [
+        # v3 API – disable all orientation helpers
+        dict(det_model_dir=det_dir, rec_model_dir=rec_dir,
+             lang="en",
+             use_angle_cls=False,          # no angle cls
+             use_doc_orient=False,         # v3: disable doc orientation (if supported)
+             use_textline_orientation=False # v3: disable textline orientation (if supported)
+        ),
+        # v2 API – only det/rec; angle cls off
+        dict(det_model_dir=det_dir, rec_model_dir=rec_dir,
+             lang="en", use_angle_cls=False)
+    ]
+    for kwargs in tried:
+        try:
+            _PADDLE = PaddleOCR(**kwargs)
+            break
+        except TypeError:
+            # Some args not supported on this version – try the next set
+            continue
+    return _PADDLE
 
 
 # ------------- core extractors -------------
@@ -111,28 +129,32 @@ def _tesseract_ocr(img: Image.Image) -> str:
         return ""
 
 def extract_text_with_paddle(pdf_bytes: bytes, conf_threshold: float = 0.70) -> str:
-    poppler_path = _POPPLER_BIN
-    images = convert_from_bytes(pdf_bytes, dpi=300, fmt="png", poppler_path=poppler_path)
+    from pdf2image import convert_from_bytes
+    from PIL import ImageFilter, ImageOps
+
+    images = convert_from_bytes(pdf_bytes, dpi=300, fmt="png",
+                                poppler_path=_POPPLER_BIN)
     o = _paddle()
-    out_texts: List[str] = []
+    out_texts: list[str] = []
 
     for img in images:
         if o is None:
-            # Just fall back to Tesseract whole-page
             out_texts.append(_tesseract_ocr(img))
             continue
 
-        result = o.ocr(ImageOps.exif_transpose(img), cls=False)
-        # result structure: [[ [box, (text, score)], ... ]]
+        # Use Paddle det+rec only (no CLS/orientation)
+        np_img = np.array(ImageOps.exif_transpose(img).convert("RGB"))
+        result = o.ocr(np_img, det=True, rec=True, cls=False)
+
         blocks = result[0] if result else []
-        lines: List[str] = []
+        lines = []
         for block in blocks:
             box, (txt, score) = block
             txt = (txt or "").strip()
             if not txt:
                 continue
             if score < conf_threshold:
-                # try kraken, else tesseract on the cropped region
+                # fallback OCR on low-confidence chunks (kraken/tesseract)
                 xs = [p[0] for p in box]; ys = [p[1] for p in box]
                 l, t, r, b = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
                 crop = img.crop((l, t, r, b))
@@ -175,4 +197,3 @@ def extract_text_and_tables(pdf_bytes: bytes) -> Tuple[str, Dict[str, str]]:
         text = extract_text_with_paddle(pdf_bytes)
     kv = _tables_to_kv(tables)
     return text, kv
-
