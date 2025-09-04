@@ -48,24 +48,41 @@ def _kraken_ocr_on_image(img: Image.Image) -> str:
             except Exception:
                 pass
 
-# PaddleOCR (lazy)
-# PaddleOCR (lazy)
+# --- PaddleOCR (lazy, offline) ---
 _PADDLE = None
+
 def _paddle():
     """
-    Create a PaddleOCR pipeline that uses local/cached models and **does not**
-    force the angle classifier (which requires PaddleX-format CLS bundles).
+    Create a PaddleOCR pipeline that uses local det/rec only.
+    - No internet: we pass explicit det/rec dirs.
+    - No CLS stage: avoids PaddleX CLS bundle requirement.
     """
     global _PADDLE
     if _PADDLE is not None:
         return _PADDLE
+
+    # Resolve local model dirs
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "paddleocr"))
+    det_dir = os.environ.get("PADDLE_DET_DIR", os.path.join(root, "en_PP-OCRv3_det_infer"))
+    rec_dir = os.environ.get("PADDLE_REC_DIR", os.path.join(root, "en_PP-OCRv3_rec_infer"))
+
+    def _has_model(d):
+        return os.path.exists(os.path.join(d, "inference.pdmodel")) and \
+               os.path.exists(os.path.join(d, "inference.pdiparams"))
+
+    # If either folder is missing, skip Paddle (prevents any download attempt)
+    if not (_has_model(det_dir) and _has_model(rec_dir)):
+        _PADDLE = None
+        return _PADDLE
+
     try:
-        # Pass only portable kwargs; no show_log, no use_gpu, no cls_model_dir
-        from paddleocr import PaddleOCR
-        _PADDLE = PaddleOCR(lang="en")
+        from paddleocr import PaddleOCR  # lazy import
+        # Only portable args; no use_gpu, no show_log, no cls_model_dir
+        _PADDLE = PaddleOCR(det_model_dir=det_dir, rec_model_dir=rec_dir, lang="en")
     except Exception:
         _PADDLE = None
     return _PADDLE
+
 
 
 # ------------- core extractors -------------
@@ -158,3 +175,4 @@ def extract_text_and_tables(pdf_bytes: bytes) -> Tuple[str, Dict[str, str]]:
         text = extract_text_with_paddle(pdf_bytes)
     kv = _tables_to_kv(tables)
     return text, kv
+
