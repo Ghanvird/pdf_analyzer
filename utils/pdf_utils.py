@@ -1,37 +1,53 @@
 # utils/pdf_utils.py
-import contextlib, io as _io
-import io, os, re, subprocess, tempfile, shutil
-from typing import Dict, List, Tuple
-from paddleocr import PaddleOCR
-import numpy as np
+# Offline-friendly PDF text & table extraction with PaddleOCR 2.x (local models),
+# plus Tesseract and optional Kraken fallback for tough regions.
 
+from __future__ import annotations
+
+import io
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from typing import Dict, List, Tuple
+
+import numpy as np
 import pdfplumber
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageOps, ImageFilter
 
 import pytesseract
+from paddleocr import PaddleOCR  # 2.x API
+
 from .tesseract_path import ensure_tesseract, auto_set_poppler_cmd
 
-# ------------- binaries (offline) -------------
-# poppler for pdf2image
-_POPPLER_BIN = None
+# ------------------------------------------------
+# Poppler (for pdf2image) — allow absence gracefully
+# ------------------------------------------------
+_POPPLER_BIN: str | None
 try:
     _POPPLER_BIN = auto_set_poppler_cmd()
 except Exception:
     _POPPLER_BIN = None
 
-# tesseract for fallback
+# ------------------------------------------------
+# Tesseract (fallback)
+# ------------------------------------------------
 try:
     ensure_tesseract()
 except Exception:
+    # Safe to continue; we only use it as a fallback.
     pass
 
-# kraken model (optional)
-_KRAKEN_MODEL = os.getenv("KRAKEN_MODEL")
+# ------------------------------------------------
+# Optional Kraken HTR (only if environment provides it)
+# ------------------------------------------------
+_KRAKEN_MODEL = os.getenv("KRAKEN_MODEL")  # e.g. r"C:\models\kraken.mlmodel"
+
 def _kraken_ocr_on_image(img: Image.Image) -> str:
     if not _KRAKEN_MODEL:
         return ""
-    # require 'kraken' CLI
     exe = shutil.which("kraken")
     if not exe:
         return ""
@@ -49,50 +65,61 @@ def _kraken_ocr_on_image(img: Image.Image) -> str:
             except Exception:
                 pass
 
-_PADDLE = None
+# ------------------------------------------------
+# PaddleOCR (2.x) — strictly local, det/rec only
+# ------------------------------------------------
 PADDLE_MODELS_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "models", "paddleocr")
 )
-DET_DIR = os.environ.get("PADDLE_DET_DIR",
-                         os.path.join(PADDLE_MODELS_ROOT, "en_PP-OCRv3_det_infer"))
-REC_DIR = os.environ.get("PADDLE_REC_DIR",
-                         os.path.join(PADDLE_MODELS_ROOT, "en_PP-OCRv3_rec_infer"))
+DET_DIR = os.path.join(PADDLE_MODELS_ROOT, "en_PP-OCRv3_det_infer")
+REC_DIR = os.path.join(PADDLE_MODELS_ROOT, "en_PP-OCRv3_rec_infer")
+
+def _models_present() -> bool:
+    def has_pair(d: str) -> bool:
+        return (
+            os.path.isdir(d)
+            and os.path.exists(os.path.join(d, "inference.pdmodel"))
+            and os.path.exists(os.path.join(d, "inference.pdiparams"))
+        )
+    return has_pair(DET_DIR) and has_pair(REC_DIR)
+
+_PADDLE: PaddleOCR | None = None
 
 def _paddle() -> PaddleOCR | None:
     """
-    Create a PaddleOCR instance that uses ONLY local det/rec models.
-    We explicitly turn OFF both orientation stages so nothing is downloaded.
-    Works with both 2.x and 3.x APIs.
+    Lazy-initialize PaddleOCR 2.x with **local** det/rec models only.
+    No angle classifier. No internet access required.
     """
     global _PADDLE
     if _PADDLE is not None:
         return _PADDLE
 
-    tried = [
-        # PaddleOCR >= 3.x: use_textline_orientation flag
-        dict(det_model_dir=DET_DIR, rec_model_dir=REC_DIR,
-             use_textline_orientation=False, lang="en"),
-        # PaddleOCR 2.x: angle classifier flag
-        dict(det_model_dir=DET_DIR, rec_model_dir=REC_DIR,
-             use_angle_cls=False, lang="en"),
-        # Minimal fallback (some builds don’t accept lang)
-        dict(det_model_dir=DET_DIR, rec_model_dir=REC_DIR),
-    ]
-    last_err = None
-    for kwargs in tried:
-        try:
-            _PADDLE = PaddleOCR(**kwargs)
-            break
-        except (TypeError, ValueError, Exception) as e:
-            last_err = e
-            _PADDLE = None
+    if not _models_present():
+        # Don't throw here; we'll just fall back to Tesseract.
+        print(
+            "[WARN] PaddleOCR local models not found. "
+            f"Expected:\n  {DET_DIR}\n  {REC_DIR}\nFalling back to Tesseract."
+        )
+        _PADDLE = None
+        return _PADDLE
 
-    if _PADDLE is None:
-        print(f"[WARN] PaddleOCR init failed; falling back to Tesseract. Last error: {last_err}")
+    try:
+        # PaddleOCR 2.x accepts numpy images and works fully offline with these dirs.
+        _PADDLE = PaddleOCR(
+            det_model_dir=DET_DIR,
+            rec_model_dir=REC_DIR,
+            use_angle_cls=False,  # keep it off so we don't need the CLS model
+            lang="en",
+        )
+    except Exception as e:
+        print(f"[WARN] PaddleOCR init failed; falling back to Tesseract. Error: {e}")
+        _PADDLE = None
+
     return _PADDLE
 
-
-# ------------- core extractors -------------
+# ------------------------------------------------
+# PDF text + tables via pdfplumber
+# ------------------------------------------------
 def extract_text_with_pdfplumber(pdf_bytes: bytes) -> Tuple[str, List[List[List[str]]]]:
     text_parts: List[str] = []
     tables: List[List[List[str]]] = []
@@ -109,6 +136,9 @@ def extract_text_with_pdfplumber(pdf_bytes: bytes) -> Tuple[str, List[List[List[
                 pass
     return "\n".join(text_parts).strip(), tables
 
+# ------------------------------------------------
+# Tesseract OCR on a PIL image
+# ------------------------------------------------
 def _tesseract_ocr(img: Image.Image) -> str:
     g = ImageOps.autocontrast(img.convert("L"))
     g = g.filter(ImageFilter.SHARPEN)
@@ -117,48 +147,60 @@ def _tesseract_ocr(img: Image.Image) -> str:
     except Exception:
         return ""
 
+# ------------------------------------------------
+# PaddleOCR 2.x page OCR (with low-score fallback to Kraken/Tesseract)
+# ------------------------------------------------
 def extract_text_with_paddle(pdf_bytes: bytes, conf_threshold: float = 0.70) -> str:
-    from pdf2image import convert_from_bytes
-    from PIL import ImageFilter, ImageOps
-
-    images = convert_from_bytes(pdf_bytes, dpi=300, fmt="png",
-                                poppler_path=_POPPLER_BIN)
-    o = _paddle()
-    out_texts: list[str] = []
+    images = convert_from_bytes(
+        pdf_bytes, dpi=300, fmt="png", poppler_path=_POPPLER_BIN
+    )
+    ocr = _paddle()
+    out_texts: List[str] = []
 
     for img in images:
-        if o is None:
+        if ocr is None:
+            # Offline Paddle not available -> whole page with Tesseract
             out_texts.append(_tesseract_ocr(img))
             continue
 
-        # Use Paddle det+rec only (no CLS/orientation)
-        np_img = np.array(ImageOps.exif_transpose(img).convert("RGB"))
-        result = o.ocr(np_img, det=True, rec=True, cls=False)
+        # Paddle 2.x expects numpy arrays
+        arr = np.array(ImageOps.exif_transpose(img).convert("RGB"))
+        # We disabled CLS at init, so keep cls=False at call to use only det+rec
+        result = ocr.ocr(arr, cls=False)
 
+        # result is: [ [ [box, (text, score)], ... ] ] for a single page
         blocks = result[0] if result else []
-        lines = []
+        lines: List[str] = []
         for block in blocks:
-            box, (txt, score) = block
+            try:
+                box, (txt, score) = block
+            except Exception:
+                # Defensive: if structure changes or block malformed
+                continue
+
             txt = (txt or "").strip()
             if not txt:
                 continue
-            if score < conf_threshold:
-                # fallback OCR on low-confidence chunks (kraken/tesseract)
+
+            if score is not None and score < conf_threshold:
+                # Try HTR/Tesseract on the bounding box
                 xs = [p[0] for p in box]; ys = [p[1] for p in box]
                 l, t, r, b = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
                 crop = img.crop((l, t, r, b))
                 htr = _kraken_ocr_on_image(crop) or _tesseract_ocr(crop)
                 if htr:
                     txt = htr
+
             lines.append(txt)
+
         out_texts.append("\n".join(lines))
 
     return "\n\n".join(t for t in out_texts if t).strip()
 
+# ------------------------------------------------
+# Convert simple 2-col tables into KV hints
+# ------------------------------------------------
 def _tables_to_kv(tables: List[List[List[str]]]) -> Dict[str, str]:
-    """
-    Convert simple 2-column tables into key->value hints.
-    """
     kv: Dict[str, str] = {}
     for tbl in tables or []:
         for row in tbl or []:
@@ -176,13 +218,17 @@ def _tables_to_kv(tables: List[List[List[str]]]) -> Dict[str, str]:
                     kv[left] = right
     return kv
 
+# ------------------------------------------------
+# Public entry: text + table-KV
+# ------------------------------------------------
 def extract_text_and_tables(pdf_bytes: bytes) -> Tuple[str, Dict[str, str]]:
     """
-    Returns (text, kv_candidates)
+    Returns (text, kv_candidates). Use pdfplumber; if the text is too short
+    (likely scanned), fall back to OCR with Paddle 2.x offline (then Tesseract).
     """
     text, tables = extract_text_with_pdfplumber(pdf_bytes)
     if len(text) < 60:
-        # looks like a scanned/poor PDF -> OCR
+        # Looks like a scanned/poor PDF -> OCR
         text = extract_text_with_paddle(pdf_bytes)
     kv = _tables_to_kv(tables)
     return text, kv
