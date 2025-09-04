@@ -1,7 +1,3 @@
-# utils/pdf_utils.py
-# Offline-friendly PDF text & table extraction with PaddleOCR 2.x (local models),
-# plus Tesseract and optional Kraken fallback for tough regions.
-
 from __future__ import annotations
 
 import io
@@ -9,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Dict, List, Tuple
 
@@ -20,7 +17,7 @@ from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 from paddleocr import PaddleOCR  # 2.x API
 
-from .tesseract_path import ensure_tesseract, auto_set_poppler_cmd
+from tesseract_path import ensure_tesseract, auto_set_poppler_cmd
 
 # ------------------------------------------------
 # Poppler (for pdf2image) — allow absence gracefully
@@ -43,17 +40,27 @@ except Exception:
 # ------------------------------------------------
 # Optional Kraken HTR (only if environment provides it)
 # ------------------------------------------------
-_KRAKEN_MODEL = os.getenv("KRAKEN_MODEL")  # e.g. r"C:\models\kraken.mlmodel"
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_DEFAULT_KRAKEN_MODEL = os.path.join(_PROJECT_ROOT, "models", "kraken", "en_best.mlmodel")
+
+# Use env var if set, else default; disable if file missing
+_KRAKEN_MODEL = os.getenv("KRAKEN_MODEL", _DEFAULT_KRAKEN_MODEL)
+if not os.path.exists(_KRAKEN_MODEL):
+    _KRAKEN_MODEL = None  # silently skip Kraken if the model file isn't there
+
+def _kraken_cmd():
+    exe = shutil.which("kraken")
+    if exe:
+        return [exe, "ocr"]
+    # Fallback to python -m kraken if the CLI shim isn't on PATH
+    return [sys.executable, "-m", "kraken", "ocr"]
 
 def _kraken_ocr_on_image(img: Image.Image) -> str:
     if not _KRAKEN_MODEL:
         return ""
-    exe = shutil.which("kraken")
-    if not exe:
-        return ""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         img.save(tmp.name, format="PNG")
-        cmd = [exe, "ocr", "-m", _KRAKEN_MODEL, "-i", tmp.name, "-"]
+        cmd = _kraken_cmd() + ["-m", _KRAKEN_MODEL, "-i", tmp.name, "-"]
         try:
             out = subprocess.run(cmd, check=True, capture_output=True, text=True)
             return (out.stdout or "").strip()
