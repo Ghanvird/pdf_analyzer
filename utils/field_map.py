@@ -7,6 +7,17 @@ import re
 from typing import Dict, List, Tuple, Optional
 from dateutil import parser as dateparser
 
+
+import warnings
+try:
+    # dateutil ≥2.9
+    from dateutil.parser import UnknownTimezoneWarning
+except Exception:
+    # older dateutil
+    from dateutil.parser._parser import UnknownTimezoneWarning  # type: ignore
+warnings.filterwarnings("ignore", category=UnknownTimezoneWarning)
+
+
 # ===============================
 # ---------- HELPERS ------------
 # ===============================
@@ -122,18 +133,25 @@ DATE_RE2 = re.compile(r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b")
 def _normalize_date_any(s: str) -> str:
     if not s:
         return ""
+    # clean up noisy tokens that trigger tz warnings or confuse parsing
     s = s.replace("|", " ")
+    s = TZ_RE.sub("", s)          # drop tokens like BST/GMT/etc.
+    # (optional) if timestamps appear, drop the time to prefer the calendar date
+    s = TIME_RE.sub("", s)
+
     try:
-        dt = dateparser.parse(s, dayfirst=True, fuzzy=True)
+        dt = dateparser.parse(s, dayfirst=True, fuzzy=True, ignoretz=True)
         return dt.strftime("%d %b %Y") if dt else ""
     except Exception:
+        # targeted fallback: pick a concrete date-looking substring and parse that
         m = DATE_RE1.search(s) or DATE_RE2.search(s)
         if m:
             try:
-                return dateparser.parse(m.group(0), dayfirst=True).strftime("%d %b %Y")
+                return dateparser.parse(m.group(0), dayfirst=True, ignoretz=True).strftime("%d %b %Y")
             except Exception:
                 return m.group(0)
         return ""
+
 
 def pick_date_in_window(win: str) -> str:
     if not win:
