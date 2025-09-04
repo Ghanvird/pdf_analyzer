@@ -1,0 +1,11 @@
+streamlit
+pandas
+openpyxl
+pdfplumber
+pdf2image
+pillow
+pytesseract
+paddlepaddle; platform_system!="Windows" or platform_machine!="ARM64"
+paddleocr
+kraken[pdf]
+numpy
