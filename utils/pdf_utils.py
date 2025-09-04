@@ -2,7 +2,7 @@
 import contextlib, io as _io
 import io, os, re, subprocess, tempfile, shutil
 from typing import Dict, List, Tuple
-
+from paddleocr import PaddleOCR
 import numpy as np
 
 import pdfplumber
@@ -50,56 +50,45 @@ def _kraken_ocr_on_image(img: Image.Image) -> str:
                 pass
 
 _PADDLE = None
+PADDLE_MODELS_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "models", "paddleocr")
+)
+DET_DIR = os.environ.get("PADDLE_DET_DIR",
+                         os.path.join(PADDLE_MODELS_ROOT, "en_PP-OCRv3_det_infer"))
+REC_DIR = os.environ.get("PADDLE_REC_DIR",
+                         os.path.join(PADDLE_MODELS_ROOT, "en_PP-OCRv3_rec_infer"))
 
-def _local_model_ok(path: str) -> bool:
-    return (
-        os.path.exists(os.path.join(path, "inference.pdmodel")) and
-        os.path.exists(os.path.join(path, "inference.pdiparams"))
-    )
-
-def _paddle():
-    """Create a PaddleOCR that uses only local det/rec models (no network)."""
+def _paddle() -> PaddleOCR | None:
+    """
+    Create a PaddleOCR instance that uses ONLY local det/rec models.
+    We explicitly turn OFF both orientation stages so nothing is downloaded.
+    Works with both 2.x and 3.x APIs.
+    """
     global _PADDLE
     if _PADDLE is not None:
         return _PADDLE
 
-    # Tell PaddleX/PaddleOCR we’re offline
-    os.environ.setdefault("PADDLEX_OFFLINE", "1")
-    os.environ.setdefault("PPOCR_OFFLINE", "1")
-
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "paddleocr"))
-    det_dir = os.environ.get("PADDLE_DET_DIR", os.path.join(root, "en_PP-OCRv3_det_infer"))
-    rec_dir = os.environ.get("PADDLE_REC_DIR", os.path.join(root, "en_PP-OCRv3_rec_infer"))
-
-    if not (_local_model_ok(det_dir) and _local_model_ok(rec_dir)):
-        # Models missing -> skip Paddle and let Tesseract handle it
-        _PADDLE = None
-        return _PADDLE
-
-    # Import inside a stdout/stderr redirect to hide hoster banners.
-    with contextlib.redirect_stdout(_io.StringIO()), contextlib.redirect_stderr(_io.StringIO()):
-        from paddleocr import PaddleOCR
-
-    # Try v3 first (has extra switches), then v2 style.
     tried = [
-        # v3 API – disable all orientation helpers
-        dict(det_model_dir=det_dir, rec_model_dir=rec_dir,
-             lang="en",
-             use_angle_cls=False,          # no angle cls
-             use_doc_orient=False,         # v3: disable doc orientation (if supported)
-             use_textline_orientation=False # v3: disable textline orientation (if supported)
-        ),
-        # v2 API – only det/rec; angle cls off
-        dict(det_model_dir=det_dir, rec_model_dir=rec_dir,
-             lang="en", use_angle_cls=False)
+        # PaddleOCR >= 3.x: use_textline_orientation flag
+        dict(det_model_dir=DET_DIR, rec_model_dir=REC_DIR,
+             use_textline_orientation=False, lang="en"),
+        # PaddleOCR 2.x: angle classifier flag
+        dict(det_model_dir=DET_DIR, rec_model_dir=REC_DIR,
+             use_angle_cls=False, lang="en"),
+        # Minimal fallback (some builds don’t accept lang)
+        dict(det_model_dir=DET_DIR, rec_model_dir=REC_DIR),
     ]
+    last_err = None
     for kwargs in tried:
         try:
             _PADDLE = PaddleOCR(**kwargs)
             break
-        except TypeError:
-            # Some args not supported on this version – try the next set
-            continue
+        except (TypeError, ValueError, Exception) as e:
+            last_err = e
+            _PADDLE = None
+
+    if _PADDLE is None:
+        print(f"[WARN] PaddleOCR init failed; falling back to Tesseract. Last error: {last_err}")
     return _PADDLE
 
 
